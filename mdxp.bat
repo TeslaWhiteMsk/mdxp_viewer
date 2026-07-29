@@ -1,3 +1,4 @@
 @echo off
-python mdxp.py %*
-
+setlocal disabledelayedexpansion
+python "%~dp0mdxp.py" %*
+endlocal
