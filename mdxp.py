@@ -8,6 +8,7 @@ Standard library only. No external dependencies.
 import sys
 import os
 import re
+import json
 import webbrowser
 import codecs
 import Tkinter as tk
@@ -116,6 +117,9 @@ def _validate_url(url):
 #   {"type": "blank"}
 
 
+_HR_RE = re.compile(r'^ {0,3}(?:-(?:[ \t]*-){2,}|\*(?:[ \t]*\*){2,}|_(?:[ \t]*_){2,})[ \t]*$')
+
+
 def _parse_blocks(lines, start=0, nesting=0):
     """Parse Markdown lines into a list of block dicts."""
     blocks = []
@@ -137,7 +141,7 @@ def _parse_blocks(lines, start=0, nesting=0):
             continue
 
         # Fenced code block
-        fence_match = re.match(r'^ {0,3}((````*)|(~~~~*))\s*(\S*)\s*$', line)
+        fence_match = re.match(r'^ {0,3}((```+)|(~~~+))\s*(\S*)\s*$', line)
         if fence_match:
             fence_char = fence_match.group(2) or fence_match.group(3)
             fence_len = len(fence_char)
@@ -150,15 +154,15 @@ def _parse_blocks(lines, start=0, nesting=0):
                 if fence_re.match(lines[i]):
                     i += 1
                     break
-                # Expand tabs
-                code_line = lines[i].replace(u"\t", u"    ")
+                # Expand tabs and strip trailing newlines
+                code_line = lines[i].replace(u"\t", u"    ").rstrip(u"\r\n")
                 code_lines.append(code_line)
                 i += 1
             blocks.append({"type": "code_block", "code": code_lines})
             continue
 
         # Horizontal rule
-        hr_match = re.match(r'^ {0,3}([-*_])[ \t]*\1[ \t]*\1[ \t]*$', stripped)
+        hr_match = _HR_RE.match(stripped)
         if hr_match:
             blocks.append({"type": "hr"})
             i += 1
@@ -218,6 +222,26 @@ def _parse_blocks(lines, start=0, nesting=0):
                 i += consumed
                 continue
 
+        # Indented code block
+        if re.match(r'^(?: {4}|\t)', line):
+            code_lines = []
+            while i < len(lines):
+                cur = lines[i]
+                if re.match(r'^(?: {4}|\t)', cur):
+                    code_line = re.sub(r'^(?: {4}|\t)', u'', cur.rstrip(u"\r\n"))
+                    code_lines.append(code_line)
+                    i += 1
+                elif not cur.strip():
+                    code_lines.append(u"")
+                    i += 1
+                else:
+                    break
+            while code_lines and not code_lines[-1].strip():
+                code_lines.pop()
+            if code_lines:
+                blocks.append({"type": "code_block", "code": code_lines})
+                continue
+
         # Setext heading or paragraph
         # Collect paragraph lines
         para_lines = []
@@ -245,7 +269,7 @@ def _parse_blocks(lines, start=0, nesting=0):
                 if not next_line.strip():
                     i += 1
                     break
-                if re.match(r'^ {0,3}([-*_])[ \t]*\1[ \t]*\1[ \t]*$', next_line.strip()):
+                if _HR_RE.match(next_line.strip()):
                     break
                 # Other block starts
                 if re.match(r'^ {0,3}>', next_line):
@@ -278,9 +302,6 @@ def _parse_list_items(lines, start, base_indent, ordered, nesting):
     if nesting > max_nesting:
         return items, 0
 
-    # Determine if we use loose or tight
-    all_blank_separators = False
-
     while i < len(lines):
         line = lines[i]
         stripped = line.lstrip()
@@ -298,35 +319,57 @@ def _parse_list_items(lines, start, base_indent, ordered, nesting):
                 item_match = None
 
         if not item_match:
+            # Blank line handling - look ahead
+            if not line.strip():
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines):
+                    next_line = lines[j]
+                    next_stripped = next_line.lstrip()
+                    next_ws = next_line[:len(next_line) - len(next_stripped)]
+                    same_level_item = False
+                    if ordered:
+                        ol = re.match(r'^(\s*)(\d{1,9})[.)]\s+', next_line)
+                        same_level_item = bool(ol) and len(ol.group(1)) == base_indent
+                    else:
+                        ul = re.match(r'^(\s*)[-*+]\s+', next_line)
+                        same_level_item = bool(ul) and len(ul.group(1)) == base_indent
+                    continuation = len(next_ws) > base_indent
+                    if same_level_item or continuation:
+                        i = j
+                        continue
+                break
+
             # Check for continuation (indented text)
             if items and line.strip() and len(ws) > base_indent:
-                # Continuation line
                 items[-1]["content_lines"].append(line)
                 i += 1
                 continue
-            # Check for nested list
-            if items and re.match(r'^(\s*)[-*+]\s', line):
-                ns = re.match(r'^(\s*)[-*+]\s+(.*)$', line)
-                if ns and len(ns.group(1)) > base_indent:
-                    items[-1]["content_lines"].append(line)
-                    i += 1
-                    continue
-            if items and re.match(r'^(\s*)\d{1,9}[.)]\s', line):
-                ns = re.match(r'^(\s*)\d{1,9}[.)]\s+(.*)$', line)
-                if ns and len(ns.group(1)) > base_indent:
-                    items[-1]["content_lines"].append(line)
-                    i += 1
-                    continue
-            break
 
-        # Check for blank line separating items
-        if items:
-            # Check if there was a blank line between items
-            pass
+            # Check for nested list at deeper indent
+            found_nested = False
+            if items:
+                ul_ns = re.match(r'^(\s*)[-*+]\s+(.*)$', line)
+                ol_ns = re.match(r'^(\s*)\d{1,9}[.)]\s+(.*)$', line)
+                if (ul_ns and len(ul_ns.group(1)) > base_indent) or \
+                   (ol_ns and len(ol_ns.group(1)) > base_indent):
+                    items[-1]["content_lines"].append(line)
+                    i += 1
+                    found_nested = True
+                    continue
+            if not found_nested:
+                break
 
         item_indent = len(item_match.group(1))
-        item_marker_content = item_match.group(2) if ordered else None
-        item_content = item_match.group(2) if not ordered else item_match.group(3)
+        if ordered:
+            item_content = item_match.group(3)
+            # content_indent = base_indent + number length + 2 (for ". " or ") ")
+            content_indent = base_indent + len(item_match.group(2)) + 2
+        else:
+            item_content = item_match.group(2)
+            # content_indent = base_indent + 2 (for "- ", "* ", "+ ")
+            content_indent = base_indent + 2
 
         # Task list
         task = None
@@ -334,31 +377,38 @@ def _parse_list_items(lines, start, base_indent, ordered, nesting):
         if task_match:
             task = task_match.group(1) in (u"x", u"X")
             item_content = task_match.group(2)
+            content_indent += 4  # "[x] " or "[ ] "
 
         items.append({
             "content_lines": [item_content],
             "task": task,
-            "start": int(item_marker_content) if ordered and item_marker_content else None,
+            "start": int(item_match.group(2)) if ordered else None,
+            "content_indent": content_indent,
         })
         i += 1
 
-        # Check for blank line (transition to loose list)
-        if i < len(lines) and not lines[i].strip():
-            pass  # We'll detect loose vs tight later
-
     # Parse content_lines into sub-blocks for each item
     for item in items:
+        content_indent = item.pop("content_indent", 0)
         content_lines = item.pop("content_lines")
         if not content_lines:
             item["content"] = [{"type": "paragraph", "lines": [u""]}]
         else:
-            # Check if content is simple (single line, no block structure)
-            # Try to parse as blocks
-            sub_blocks, _ = _parse_blocks(content_lines, 0, nesting + 1)
+            # Strip content_indent from continuation lines (skip first line which is item content)
+            processed = []
+            for idx, cl in enumerate(content_lines):
+                if idx == 0:
+                    processed.append(cl)
+                else:
+                    if len(cl) > content_indent:
+                        processed.append(cl[content_indent:])
+                    else:
+                        processed.append(cl.lstrip())
+            sub_blocks, _ = _parse_blocks(processed, 0, nesting + 1)
             if sub_blocks:
                 item["content"] = sub_blocks
             else:
-                item["content"] = [{"type": "paragraph", "lines": content_lines}]
+                item["content"] = [{"type": "paragraph", "lines": processed}]
 
     return items, i - start
 
@@ -381,71 +431,7 @@ def _parse_list_items(lines, start, base_indent, ordered, nesting):
 
 def _parse_inline(text):
     """Parse inline Markdown into token list."""
-    tokens = []
-    pos = 0
-    text = _to_unicode(text)
-    remaining = text
-
-    # First pass: extract code spans (they protect content)
-    code_spans = []
-    code_positions = []
-    code_processed = u""
-    cp = 0
-    while cp < len(remaining):
-        # Find opening backtick(s)
-        if remaining[cp] == u'`':
-            start = cp
-            backtick_count = 0
-            while cp < len(remaining) and remaining[cp] == u'`':
-                backtick_count += 1
-                cp += 1
-            # Find matching close
-            close_pos = remaining.find(u'`' * backtick_count, cp)
-            if close_pos != -1:
-                inner = remaining[cp:close_pos]
-                # Strip one leading/trailing space if both exist
-                if len(inner) >= 2 and inner[0] == u' ' and inner[-1] == u' ':
-                    inner = inner[1:-1]
-                code_spans.append(inner)
-                code_positions.append((len(code_processed), len(code_processed) + 4))
-                code_processed += u"\x00CODE%d\x00" % (len(code_spans) - 1)
-                cp = close_pos + backtick_count
-            else:
-                # Unclosed code span, treat as literal
-                code_processed += remaining[start:cp]
-        else:
-            code_processed += remaining[cp]
-            cp += 1
-
-    # Second pass: link/image/autolink detection on code_processed
-    # We use a stepwise approach
-    segments = _parse_inline_core(code_processed)
-
-    # Re-insert code spans
-    result = []
-    for seg in segments:
-        if seg[0] == "text":
-            t = seg[1]
-            # Replace code placeholders
-            while u"\x00CODE" in t:
-                m = re.search(r'\x00CODE(\d+)\x00', t)
-                if m:
-                    idx = int(m.group(1))
-                    before = t[:m.start()]
-                    after = t[m.end():]
-                    if before:
-                        result.append(("text", before))
-                    if idx < len(code_spans):
-                        result.append(("code", code_spans[idx]))
-                    t = after
-                else:
-                    break
-            if t:
-                result.append(("text", t))
-        else:
-            result.append(seg)
-
-    return result
+    return _parse_inline_core(_to_unicode(text))
 
 
 def _parse_inline_core(text):
@@ -477,6 +463,25 @@ def _parse_inline_core(text):
             else:
                 tokens.append(("text", ch))
                 pos += 1
+                continue
+
+        # Code span
+        if ch == u'`':
+            backtick_count = 0
+            start = pos
+            while pos < len_text and text[pos] == u'`':
+                backtick_count += 1
+                pos += 1
+            close_pos = text.find(u'`' * backtick_count, pos)
+            if close_pos != -1:
+                inner = text[pos:close_pos]
+                if len(inner) >= 2 and inner[0] == u' ' and inner[-1] == u' ':
+                    inner = inner[1:-1]
+                tokens.append(("code", inner))
+                pos = close_pos + backtick_count
+                continue
+            else:
+                tokens.append(("text", text[start:pos]))
                 continue
 
         if ch == u'\n':
@@ -696,7 +701,7 @@ def _inline_tokens_to_flat(tokens):
     def _normalize(flags):
         if not flags:
             return u""
-        order = u"bisc"
+        order = u"cbis"
         return u"".join(sorted(set(flags), key=lambda x: order.index(x) if x in order else 99))
 
     def _flatten(token_list, style_flags, link_url):
@@ -858,7 +863,6 @@ class MdxpViewer(object):
                 pass
 
         # Code fonts
-        code_sizes = [size, size, size, size]
         code_styles = [
             ("c", {}),
             ("cb", {"weight": "bold"}),
@@ -868,6 +872,17 @@ class MdxpViewer(object):
         for (tag, kw) in code_styles:
             f = tkFont.Font(family=code_family, size=size, **kw)
             self._tag_fonts[tag] = f
+        for code_tag in ["cs", "cbs", "cis", "cbis"]:
+            kw = {}
+            if "b" in code_tag:
+                kw["weight"] = "bold"
+            if "i" in code_tag:
+                kw["slant"] = "italic"
+            try:
+                f = tkFont.Font(family=code_family, size=size, overstrike=True, **kw)
+                self._tag_fonts[code_tag] = f
+            except Exception:
+                pass
 
         # Heading fonts - relative sizes
         h_offsets = [8, 6, 4, 2, 1, 0]
@@ -904,7 +919,8 @@ class MdxpViewer(object):
 
         # Style tags
         for tag in ["b", "i", "bi", "s", "bs", "is", "bis",
-                     "c", "cb", "ci", "cbi"]:
+                     "c", "cb", "ci", "cbi",
+                     "cs", "cbs", "cis", "cbis"]:
             if tag in self._tag_fonts:
                 t.tag_configure(tag, font=self._tag_fonts[tag])
 
@@ -1212,6 +1228,8 @@ class MdxpViewer(object):
                 weight = "bold"
             if u"i" in rest:
                 slant = "italic"
+            if u"s" in rest:
+                overstrike = True
         else:
             if u"b" in combined:
                 weight = "bold"
@@ -1311,8 +1329,21 @@ class MdxpViewer(object):
         content = None
         self.current_encoding = u"utf-8"
 
+        # Detect BOM first
+        has_bom = False
+        try:
+            with open(path, "rb") as bom_f:
+                has_bom = (bom_f.read(3) == b"\xef\xbb\xbf")
+        except Exception:
+            has_bom = False
+
+        if has_bom:
+            encoding_try = [u"utf-8-sig"]
+        else:
+            encoding_try = [u"utf-8", u"cp1251", u"latin-1"]
+
         # Try encoding detection
-        for enc in (u"utf-8-sig", u"utf-8", u"cp1251", u"latin-1"):
+        for enc in encoding_try:
             try:
                 with codecs.open(path, "r", encoding=enc) as f:
                     content = f.read()
@@ -1487,7 +1518,8 @@ class MdxpViewer(object):
             try:
                 self._render_block(tw, block, 0)
             except Exception:
-                pass
+                import traceback
+                traceback.print_exc()
 
     def _render_block(self, tw, block, quote_level):
         btype = block.get(u"type")
@@ -1499,7 +1531,7 @@ class MdxpViewer(object):
             self._render_heading(tw, block, quote_level)
 
         elif btype == u"code_block":
-            self._render_code_block(tw, block)
+            self._render_code_block(tw, block, quote_level)
 
         elif btype == u"hr":
             tw.insert(tk.END, u"\u2500" * 40 + u"\n", u"hr")
@@ -1553,10 +1585,11 @@ class MdxpViewer(object):
         flat = _inline_tokens_to_flat(tokens)
 
         base_tag = None
+        extra_tags = []
         if quote_level > 0:
-            base_tag = u"quote%d" % quote_level
+            extra_tags.append(u"quote%d" % quote_level)
 
-        self._emit_flat(tw, flat, base_tag)
+        self._emit_flat(tw, flat, base_tag, extra_tags)
 
         # End paragraph
         tw.insert(tk.END, u"\n\n")
@@ -1573,26 +1606,34 @@ class MdxpViewer(object):
         flat = _inline_tokens_to_flat(tokens)
 
         base_tag = u"h%d" % level
-        self._emit_flat(tw, flat, base_tag)
+        extra_tags = []
+        if quote_level > 0:
+            extra_tags.append(u"quote%d" % quote_level)
+        self._emit_flat(tw, flat, base_tag, extra_tags)
         tw.insert(tk.END, u"\n\n")
 
-    def _render_code_block(self, tw, block):
+    def _render_code_block(self, tw, block, quote_level=0):
         code = block.get(u"code", [])
         if not code:
             tw.insert(tk.END, u"\n")
             return
 
+        tags = [u"codeblock"]
+        if quote_level > 0:
+            tags.append(u"quote%d" % quote_level)
+
         tw.insert(tk.END, u"\n")
         for line in code:
-            # In code blocks, we escape < and > for safety but keep everything else
             safe_line = line.replace(u"\t", u"    ")
-            tw.insert(tk.END, safe_line + u"\n", u"codeblock")
+            tw.insert(tk.END, safe_line + u"\n", tuple(tags))
         tw.insert(tk.END, u"\n")
 
-    def _render_list(self, tw, block, quote_level):
+    def _render_list(self, tw, block, quote_level, indent_level=0):
         ordered = block.get(u"ordered", False)
         items = block.get(u"items", [])
         start = block.get(u"start", 1)
+
+        pad = u"    " * indent_level
 
         for idx, item in enumerate(items):
             task = item.get(u"task")
@@ -1613,29 +1654,33 @@ class MdxpViewer(object):
                 else:
                     task_prefix = u"[ ] "
 
-            # Calculate indent for list (for nested lists inside items)
-            list_indent = len(prefix) + len(task_prefix)
-
             # Insert the bullet/number + task prefix
             tag = None
             if quote_level > 0:
                 tag = u"quote%d" % quote_level
             if tag:
-                tw.insert(tk.END, prefix + task_prefix, tag)
+                tw.insert(tk.END, pad + prefix + task_prefix, tag)
             else:
-                tw.insert(tk.END, prefix + task_prefix)
+                tw.insert(tk.END, pad + prefix + task_prefix)
 
             # Render item content
+            first_sub = True
             for sub in content:
+                if not first_sub and sub.get(u"type") != u"list":
+                    tw.insert(tk.END, u"\n")
+                first_sub = False
                 if sub.get(u"type") == u"paragraph":
                     lines = sub.get(u"lines", [])
                     text = u" ".join(l.rstrip(u"\n\r") for l in lines)
                     tokens = _parse_inline(text)
                     flat = _inline_tokens_to_flat(tokens)
-                    self._emit_flat(tw, flat, tag)
+                    extra_tags = []
+                    if quote_level > 0:
+                        extra_tags.append(u"quote%d" % quote_level)
+                    self._emit_flat(tw, flat, None, extra_tags)
                 elif sub.get(u"type") == u"list":
-                    # Nested list - indent more
-                    self._render_list(tw, sub, quote_level)
+                    tw.insert(tk.END, u"\n")
+                    self._render_list(tw, sub, quote_level, indent_level + 1)
                 else:
                     self._render_block(tw, sub, quote_level)
 
@@ -1647,13 +1692,15 @@ class MdxpViewer(object):
     # Inline emission
     # -----------------------------------------------------------------------
 
-    def _emit_flat(self, tw, flat_tokens, base_tag):
+    def _emit_flat(self, tw, flat_tokens, base_tag=None, extra_tags=None):
         for text, style_flags, link_url in flat_tokens:
             if not text:
                 continue
 
             # Build tags list
             tags = []
+            if extra_tags:
+                tags.extend(extra_tags)
             if base_tag:
                 tags.append(base_tag)
 
@@ -1662,17 +1709,19 @@ class MdxpViewer(object):
             if style_tag:
                 tags.append(style_tag)
 
-            # Link handling
+            # Link handling - validate URL before making clickable
             if link_url:
-                self._link_counter += 1
-                link_tag = u"lnk_%d" % self._link_counter
-                self._link_tags[link_tag] = link_url
-                try:
-                    tw.tag_configure(link_tag, foreground=u"#0000cc",
-                                     underline=True)
-                except Exception:
-                    pass
-                tags.append(link_tag)
+                safe_url = _validate_url(_to_unicode(link_url))
+                if safe_url:
+                    self._link_counter += 1
+                    link_tag = u"lnk_%d" % self._link_counter
+                    self._link_tags[link_tag] = safe_url
+                    try:
+                        tw.tag_configure(link_tag, foreground=u"#0000cc",
+                                         underline=True)
+                    except Exception:
+                        pass
+                    tags.append(link_tag)
 
             # Insert if we have text
             if text:
@@ -1703,7 +1752,8 @@ class MdxpViewer(object):
 
         # Body context - use style tag directly
         if style_flags in (u"b", u"i", u"bi", u"s", u"bs", u"is", u"bis",
-                           u"c", u"cb", u"ci", u"cbi"):
+                           u"c", u"cb", u"ci", u"cbi",
+                           u"cs", u"cbs", u"cis", u"cbis"):
             return style_flags
 
         # Dynamic combination
@@ -2179,12 +2229,15 @@ class MdxpViewer(object):
             except Exception:
                 pass
 
-            # Recent files
+            # Recent files (JSON format)
             try:
                 recent = parser.get(u"files", u"recent")
                 if recent:
-                    paths = recent.split(u"\n")
-                    self._recent_files = [p for p in paths if p]
+                    raw = _to_unicode(recent).strip()
+                    if raw.startswith(u"["):
+                        self._recent_files = json.loads(raw)
+                    else:
+                        self._recent_files = [p for p in raw.split(u"\n") if p]
                     if len(self._recent_files) > 5:
                         self._recent_files = self._recent_files[:5]
             except Exception:
@@ -2196,6 +2249,10 @@ class MdxpViewer(object):
         # Apply settings
         self._update_recent_menu()
         self._setup_fonts()
+        self._apply_wrap()
+        if hasattr(self, "text") and self.text:
+            if "body" in self._tag_fonts:
+                self.text.configure(font=self._tag_fonts["body"])
 
     def _save_config(self):
         cfg_path = self._get_config_path()
@@ -2227,8 +2284,8 @@ class MdxpViewer(object):
             parser.set(u"view", u"font_size", str(self._font_size))
 
             parser.add_section(u"files")
-            parser.set(u"files", u"recent",
-                       u"\n".join(self._recent_files))
+            recent_json = json.dumps(self._recent_files, ensure_ascii=True)
+            parser.set(u"files", u"recent", recent_json)
 
             with codecs.open(cfg_path, "w", encoding="utf-8") as f:
                 parser.write(f)
